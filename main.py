@@ -908,7 +908,7 @@ from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSlider,
-    QSpinBox, QVBoxLayout, QWidget,
+    QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 QSS = """
@@ -961,6 +961,19 @@ QCheckBox { color: #cfcfcf; font-size: 12px; }
 QCheckBox::indicator { width: 16px; height: 16px; border-radius: 4px;
     background: #262626; border: 1px solid #333; }
 QCheckBox::indicator:checked { background: #ff66aa; border-color: #ff66aa; }
+
+QTabWidget::pane {
+    border: 1px solid #333; border-radius: 8px;
+    background: #1f1f1f; top: -1px;
+}
+QTabWidget::tab-bar { alignment: left; }
+QTabBar::tab {
+    background: #2a2a2a; color: #9a9a9a; border: 1px solid #333;
+    border-bottom: none; border-top-left-radius: 8px;
+    border-top-right-radius: 8px; padding: 8px 18px; font-size: 12px;
+}
+QTabBar::tab:selected { background: #1f1f1f; color: #ff66aa; }
+QTabBar::tab:hover:!selected { background: #333; color: #cfcfcf; }
 """
 
 
@@ -1144,13 +1157,18 @@ class App(QWidget):
         row.addWidget(self.use_current_btn)
         lay.addLayout(row)
 
-        heading = QLabel("Split")
-        heading.setObjectName("heading")
-        lay.addWidget(heading)
+        # Two horizontal tabs on top, with the tab labels aligned to the left.
+        self.tabs = QTabWidget()
+
+        # --- Split tab -------------------------------------------------------
+        split_page = QWidget()
+        split_lay = QVBoxLayout(split_page)
+        split_lay.setContentsMargins(12, 12, 12, 12)
+        split_lay.setSpacing(8)
 
         self.diff_btn = QPushButton("Split by Difficulty")
         self.diff_btn.clicked.connect(self._split_difficulty)
-        lay.addWidget(self.diff_btn)
+        split_lay.addWidget(self.diff_btn)
 
         len_row = QHBoxLayout()
         self.len_btn = QPushButton("Split by Length")
@@ -1161,24 +1179,34 @@ class App(QWidget):
         len_row.addWidget(self.len_btn, 1)
         len_row.addWidget(QLabel("parts:"))
         len_row.addWidget(self.parts_spin, 0)
-        lay.addLayout(len_row)
+        split_lay.addLayout(len_row)
+        split_lay.addStretch()
 
-        diff_heading = QLabel("Adjust Difficulty")
-        diff_heading.setObjectName("heading")
-        lay.addWidget(diff_heading)
+        self.tabs.addTab(split_page, "Split")
+
+        # --- Adjust Difficulty tab -------------------------------------------
+        adjust_page = QWidget()
+        adjust_lay = QVBoxLayout(adjust_page)
+        adjust_lay.setContentsMargins(12, 12, 12, 12)
+        adjust_lay.setSpacing(8)
 
         hp_row, self.hp_slider, self.hp_spin = self._make_diff_row("HP:")
         cs_row, self.cs_slider, self.cs_spin = self._make_diff_row("CS:")
         od_row, self.od_slider, self.od_spin = self._make_diff_row("OD:")
         ar_row, self.ar_slider, self.ar_spin = self._make_diff_row("AR:")
-        lay.addLayout(hp_row)
-        lay.addLayout(cs_row)
-        lay.addLayout(od_row)
-        lay.addLayout(ar_row)
+        adjust_lay.addLayout(hp_row)
+        adjust_lay.addLayout(cs_row)
+        adjust_lay.addLayout(od_row)
+        adjust_lay.addLayout(ar_row)
 
         self.adjust_btn = QPushButton("Generate Adjusted Map")
         self.adjust_btn.clicked.connect(self._adjust_difficulty)
-        lay.addWidget(self.adjust_btn)
+        adjust_lay.addWidget(self.adjust_btn)
+        adjust_lay.addStretch()
+
+        self.tabs.addTab(adjust_page, "Adjust Difficulty")
+
+        lay.addWidget(self.tabs)
 
         out_row = QHBoxLayout()
         self.out_edit = QLineEdit(default_output_dir())
@@ -1279,6 +1307,11 @@ class App(QWidget):
             self._tosu_ok = False
             self.ingame_label.setText("In game: — (tosu not running)")
             self.use_current_btn.setEnabled(False)
+            # No live beatmap to track — show the "open osu!" placeholder.
+            self._render_card(
+                "Open osu!",
+                "tosu is not responding — start the game to detect the "
+                "current beatmap.", None)
             return
         if not self._tosu_ok:
             self._tosu_ok = True  # recovered
@@ -1286,14 +1319,25 @@ class App(QWidget):
         if not meta:
             self.use_current_btn.setEnabled(False)
             self.ingame_label.setText("In game: —")
+            # tosu is up but osu! is closed / returned no beatmap.
+            self._render_card(
+                "Open osu!",
+                "osu! is not open — no beatmap to detect.", None)
             return
         self.use_current_btn.setEnabled(bool(meta.get("has_osu")))
         if meta.get("title"):
             self.ingame_label.setText(
                 f"In game: {meta['artist']} - {meta['title']} "
                 f"[{meta['version']}]  ({meta['state']})")
+            self._render_card(
+                f"{meta['artist']} - {meta['title']} [{meta['version']}]",
+                f"Current map · {meta['state']}",
+                tosu_fetch_bytes("/files/beatmap/background"))
         else:
             self.ingame_label.setText("In game: —")
+            self._render_card(
+                "Open osu!",
+                "No beatmap selected in osu!.", None)
         self._autofill_stable_dir()
 
     def _autofill_stable_dir(self):
