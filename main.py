@@ -2,11 +2,12 @@
 """Sheldinner Practice — cross-platform osu! beatmap splitter.
 
 A single-file app: parses .osu files, splits them by difficulty (rosu-pp-py
-strain peaks) or by equal length, packages the results into .osz archives
-and imports them into osu! (stable or lazer) via the game's native import
-path. The optional "current running beatmap" preview is provided by tosu
-(https://github.com/tosuapp/tosu), a cross-platform memory reader for both
-osu!stable and osu!lazer; a file dialog is the always-available fallback.
+strain peaks) or by equal length, adjusts HP/CS/OD/AR, packages the results
+into .osz archives and imports them into osu! (stable or lazer) via the
+game's native import path. The optional "current running beatmap" preview is
+provided by tosu (https://github.com/tosuapp/tosu), a cross-platform memory
+reader for both osu!stable and osu!lazer; a file dialog is the
+always-available fallback.
 """
 
 from __future__ import annotations
@@ -141,6 +142,37 @@ def parse_osu(path: str | None = None, content: str | None = None,
     )
 
 
+def get_difficulty_values(parsed: OsuMap) -> dict:
+    """Read HP/CS/OD/AR from a parsed OsuMap's [Difficulty] section.
+
+    Returns {'hp', 'cs', 'od', 'ar'}, each defaulting to 5.0 if missing or
+    unparsable. AR falls back to OD if the map predates the ApproachRate key
+    (that was the original client behavior before AR was split out from OD).
+    """
+    def _val(key: str) -> float | None:
+        raw = _kv(parsed.lines, "Difficulty", key)
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    hp = _val("HPDrainRate")
+    cs = _val("CircleSize")
+    od = _val("OverallDifficulty")
+    ar = _val("ApproachRate")
+    if ar is None:
+        ar = od if od is not None else 5.0
+
+    return {
+        "hp": hp if hp is not None else 5.0,
+        "cs": cs if cs is not None else 5.0,
+        "od": od if od is not None else 5.0,
+        "ar": ar,
+    }
+
+
 def _hitobject_time(line: str) -> int | None:
     parts = line.split(",")
     if len(parts) < 3:
@@ -181,6 +213,44 @@ def _build_split_osu(base: OsuMap, version: str, hitobjects: list[str],
         else:
             out.append(line)
     out.extend(hitobjects)
+    return "".join(out)
+
+
+def _build_adjusted_osu(base: OsuMap, version: str,
+                        hp: float, cs: float, od: float, ar: float,
+                        strip_beatmap_id: bool = False, strip_set_id: bool = False,
+                        set_id_value: int = 0,
+                        title_suffix: str = "") -> str:
+    """Rebuild the full .osu text with HP/CS/OD/AR overridden.
+
+    Same header-rebuild approach as `_build_split_osu`, but keeps every
+    hitobject (no time-slicing) and swaps in new difficulty values by
+    matching each key's line prefix.
+    """
+    out: list[str] = []
+    for line in base.lines[:base.header_end]:
+        s = line.strip()
+        if s.startswith("Version:"):
+            out.append(f"Version:{version}\n")
+        elif s.startswith("HPDrainRate:"):
+            out.append(f"HPDrainRate:{hp}\n")
+        elif s.startswith("CircleSize:"):
+            out.append(f"CircleSize:{cs}\n")
+        elif s.startswith("OverallDifficulty:"):
+            out.append(f"OverallDifficulty:{od}\n")
+        elif s.startswith("ApproachRate:"):
+            out.append(f"ApproachRate:{ar}\n")
+        elif strip_beatmap_id and s.startswith("BeatmapID:"):
+            out.append("BeatmapID:0\n")
+        elif strip_set_id and s.startswith("BeatmapSetID:"):
+            out.append(f"BeatmapSetID:{set_id_value}\n")
+        elif title_suffix and (s.startswith("Title:")
+                               or s.startswith("TitleUnicode:")):
+            key, val = line.split(":", 1)
+            out.append(f"{key}:{val.strip()} {title_suffix}\n")
+        else:
+            out.append(line)
+    out.extend(base.hitobjects)
     return "".join(out)
 
 
@@ -376,12 +446,17 @@ class SplitResult:
 
 def split_by_difficulty(source: MapSource, mods: int = 0,
                         threshold_pct: float = 0.4,
-                        max_sections: int = 12) -> SplitResult:
+                        min_peak_strain: float = 100.0) -> SplitResult:
     """Detect difficulty spikes via rosu-pp strain peaks and return sections.
 
-    Finds local maxima in the aim curve, expands each to a contiguous region
-    above a *relative* fraction of that peak, then merges overlaps. Always
-    returns at least one section when the map has any strain at all.
+    Ported from the Windows build's peak-picking algorithm: repeatedly takes
+    the single highest strain value *still unclaimed* across the whole curve
+    (a global reference to the hardest remaining point, re-evaluated every
+    iteration — not a local-maxima scan), expands outward from it while
+    neighbouring strain stays >= threshold_pct of that peak, marks those
+    indices as used, and removes them from the candidate pool before picking
+    the next peak. Because claimed indices are excluded up front, sections
+    can never overlap, so no separate merge pass is needed.
     """
     parsed = source.parsed
     if parsed.mode != 0:
@@ -403,69 +478,59 @@ def split_by_difficulty(source: MapSource, mods: int = 0,
         return SplitResult(sections=[], strains=[], section_length=400.0)
 
     section_len = float(strains.section_length) or 400.0
+    aim = list(aim)
     n = len(aim)
     if n == 0:
-        return SplitResult(sections=[], strains=list(aim),
+        return SplitResult(sections=[], strains=aim,
                            section_length=section_len)
     if max(aim) <= 0:
-        return SplitResult(sections=[], strains=list(aim),
+        return SplitResult(sections=[], strains=aim,
                            section_length=section_len)
 
-    # Local maxima (skip duplicates on plateaus to one representative).
-    peaks: list[tuple[int, float]] = []
-    for i in range(n):
-        left = aim[i - 1] if i > 0 else float("-inf")
-        right = aim[i + 1] if i < n - 1 else float("-inf")
-        if aim[i] >= left and aim[i] >= right and aim[i] > 0:
-            if i > 0 and aim[i] == aim[i - 1]:
-                continue
-            peaks.append((i, aim[i]))
-    peaks.sort(key=lambda x: x[1], reverse=True)
+    remaining = [(i, val) for i, val in enumerate(aim)]
+    remaining.sort(key=lambda x: x[1], reverse=True)
 
     sections: list[Section] = []
-    used: set[int] = set()
-    for pidx, pval in peaks:
-        if pidx in used:
+    used_indices: set[int] = set()
+
+    while remaining:
+        peak_idx, peak_val = remaining[0]
+
+        if peak_val < min_peak_strain:
+            break
+
+        if peak_idx in used_indices:
+            remaining.pop(0)
             continue
-        thresh = pval * threshold_pct
-        s = pidx
-        while s > 0 and aim[s - 1] >= thresh:
-            s -= 1
-        e = pidx
-        while e < n - 1 and aim[e + 1] >= thresh:
-            e += 1
+
+        threshold = peak_val * threshold_pct
+
+        start_idx = peak_idx
+        while start_idx > 0 and aim[start_idx - 1] >= threshold:
+            start_idx -= 1
+
+        end_idx = peak_idx
+        while end_idx < n - 1 and aim[end_idx + 1] >= threshold:
+            end_idx += 1
+
         sections.append(Section(
-            start_ms=int(s * section_len),
-            end_ms=int((e + 1) * section_len),
-            peak_ms=int(pidx * section_len),
-            peak_strain=float(pval),
+            start_ms=int(start_idx * section_len),
+            end_ms=int(end_idx * section_len),
+            peak_ms=int(peak_idx * section_len),
+            peak_strain=float(peak_val),
         ))
-        for k in range(s, e + 1):
-            used.add(k)
+
+        for i in range(start_idx, end_idx + 1):
+            used_indices.add(i)
+
+        remaining = [(i, val) for i, val in remaining if i not in used_indices]
 
     sections.sort(key=lambda s: s.start_ms)
 
-    # Merge overlapping / adjacent sections.
-    merged: list[Section] = []
-    for s in sections:
-        if merged and s.start_ms <= merged[-1].end_ms:
-            merged[-1].end_ms = max(merged[-1].end_ms, s.end_ms)
-            if s.peak_strain > merged[-1].peak_strain:
-                merged[-1].peak_strain = s.peak_strain
-                merged[-1].peak_ms = s.peak_ms
-        else:
-            merged.append(s)
+    if not sections:
+        sections = [Section(0, int(n * section_len))]
 
-    if not merged:
-        merged = [Section(0, int(n * section_len))]
-
-    # Cap to the most prominent sections if there are too many.
-    if len(merged) > max_sections:
-        merged.sort(key=lambda s: s.peak_strain, reverse=True)
-        merged = merged[:max_sections]
-        merged.sort(key=lambda s: s.start_ms)
-
-    return SplitResult(sections=merged, strains=list(aim),
+    return SplitResult(sections=sections, strains=aim,
                        section_length=section_len)
 
 
@@ -564,6 +629,43 @@ def package_osz(source: MapSource, sections: list[Section],
     return osz_path
 
 
+def package_adjusted_osz(source: MapSource, hp: float, cs: float, od: float,
+                         ar: float, out_dir: str, label: str) -> str:
+    """Package a single difficulty-adjusted map into an .osz archive.
+
+    Same shape as `package_osz`, but for one whole-map .osu (built via
+    `_build_adjusted_osu`) instead of several time-sliced sections.
+    """
+    parsed = source.parsed
+    base_name = _safe_name(parsed.version or Path(parsed.osu_path or "map").stem
+                           or "map")
+    set_name = _safe_name(
+        f"{parsed.artist} - {parsed.title} ({parsed.creator}) {label}"
+        or "sheldinner-adjusted")
+
+    os.makedirs(out_dir, exist_ok=True)
+    osz_path = os.path.join(out_dir, f"{set_name}.osz")
+
+    version = f"HP-{hp} CS-{cs} OD-{od} AR-{ar}"
+    inside = f"{base_name} HP-{hp} CS-{cs} OD-{od} AR-{ar}.osu"
+    text = _build_adjusted_osu(parsed, version, hp, cs, od, ar,
+                               strip_beatmap_id=True, strip_set_id=True,
+                               title_suffix=f"({label})")
+
+    with zipfile.ZipFile(osz_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(inside, text)
+        if isinstance(source, LocalSource):
+            for name, data in source.iter_assets(exclude_osu=True):
+                z.writestr(name, data)
+        else:
+            if source.audio_bytes and parsed.audio_filename:
+                z.writestr(parsed.audio_filename, source.audio_bytes)
+            if source.bg_bytes and parsed.bg_filename:
+                z.writestr(parsed.bg_filename, source.bg_bytes)
+
+    return osz_path
+
+
 def write_split_as_new_set(source: MapSource, sections: list[Section],
                             songs_root: str, label: str) -> dict:
     """Duplicate the beatmap as a *new* stable set containing the split diffs.
@@ -627,6 +729,59 @@ def write_split_as_new_set(source: MapSource, sections: list[Section],
             f.write(text)
         written.append(out_path)
     return {"folder": new_folder, "paths": written}
+
+
+def write_adjusted_as_new_set(source: MapSource, hp: float, cs: float,
+                              od: float, ar: float, songs_root: str,
+                              label: str) -> dict:
+    """Duplicate the beatmap as a new stable set with HP/CS/OD/AR overridden.
+
+    Same BSS-safe duplication rules as `write_split_as_new_set` (non-numeric
+    folder prefix, BeatmapID 0 / BeatmapSetID -1), but for a single
+    difficulty-adjusted whole map instead of time-sliced sections.
+    """
+    parsed = source.parsed
+    base_name = _safe_name(parsed.version or Path(parsed.osu_path or "map").stem
+                           or "map")
+    set_folder_name = _safe_name(
+        f"Sheldinner {parsed.artist} - {parsed.title} ({label})")
+    if set_folder_name and set_folder_name[0].isdigit():
+        set_folder_name = "_" + set_folder_name
+
+    new_folder = os.path.join(songs_root, set_folder_name)
+    os.makedirs(new_folder, exist_ok=True)
+
+    if isinstance(source, LocalSource):
+        src_folder = source.folder
+        if src_folder and os.path.isdir(src_folder):
+            for entry in os.listdir(src_folder):
+                full = os.path.join(src_folder, entry)
+                if not os.path.isfile(full):
+                    continue
+                if entry.lower().endswith(".osu"):
+                    continue
+                try:
+                    shutil.copyfile(full, os.path.join(new_folder, entry))
+                except OSError:
+                    continue
+    else:
+        if source.audio_bytes and parsed.audio_filename:
+            with open(os.path.join(new_folder, parsed.audio_filename),
+                      "wb") as f:
+                f.write(source.audio_bytes)
+        if source.bg_bytes and parsed.bg_filename:
+            with open(os.path.join(new_folder, parsed.bg_filename), "wb") as f:
+                f.write(source.bg_bytes)
+
+    version = f"HP-{hp} CS-{cs} OD-{od} AR-{ar}"
+    inside = f"{base_name} HP-{hp} CS-{cs} OD-{od} AR-{ar}.osu"
+    text = _build_adjusted_osu(parsed, version, hp, cs, od, ar,
+                               strip_beatmap_id=True, strip_set_id=True,
+                               set_id_value=-1)
+    out_path = os.path.join(new_folder, inside)
+    with open(out_path, "w", encoding="utf-8-sig") as f:
+        f.write(text)
+    return {"folder": new_folder, "paths": [out_path]}
 
 
 # --------------------------------------------------------------------------- #
@@ -751,9 +906,9 @@ def default_output_dir() -> str:
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QProgressBar, QPushButton, QSpinBox,
-    QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QSlider,
+    QSpinBox, QVBoxLayout, QWidget,
 )
 
 QSS = """
@@ -775,11 +930,26 @@ QPushButton:pressed { background: #222; }
 QPushButton:disabled { color: #666; background: #202020; border-color: #262626; }
 QPushButton#iconbtn { background: transparent; border: none; }
 
-QLineEdit, QSpinBox {
+QLineEdit, QSpinBox, QDoubleSpinBox {
     background: #262626; border: 1px solid #333; border-radius: 6px;
     padding: 6px; font-size: 12px;
 }
-QLineEdit:focus, QSpinBox:focus { border-color: #ff66aa; }
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #ff66aa; }
+
+QSlider::groove:horizontal {
+    background: #262626; height: 6px; border-radius: 3px;
+}
+QSlider::sub-page:horizontal {
+    background: #ff66aa; border-radius: 3px;
+}
+QSlider::add-page:horizontal {
+    background: #262626; border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    background: #ff66aa; border: 2px solid #ff66aa;
+    width: 14px; height: 14px; margin: -5px 0; border-radius: 8px;
+}
+QSlider::handle:horizontal:hover { background: #ff85bb; border-color: #ff85bb; }
 
 QProgressBar {
     background: #262626; border: none; border-radius: 6px; height: 8px;
@@ -814,7 +984,7 @@ class App(QWidget):
         screen = QApplication.primaryScreen()
         geo = screen.availableGeometry()
         self.w = max(420, int(geo.width() * 0.22))
-        self.h = max(560, int(geo.height() * 0.52))
+        self.h = max(720, int(geo.height() * 0.62))
         self.setFixedSize(self.w, self.h)
 
         self._source: MapSource | None = None
@@ -897,6 +1067,66 @@ class App(QWidget):
         lay.addLayout(info)
         return card
 
+    def _make_diff_row(self, label_text: str, default: float = 5.0):
+        """One HP/CS/OD/AR control: label + slider + spinbox, kept in sync.
+
+        Slider is 0-100 (int) mapped to 0.0-10.0 (float, 0.1 steps) so it
+        drives the same range as the spinbox without a custom widget.
+        Returns (row_layout, slider, spinbox).
+        """
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        label = QLabel(label_text)
+        label.setFixedWidth(30)
+
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, 100)
+        slider.setValue(int(round(default * 10)))
+
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 10.0)
+        spin.setSingleStep(0.1)
+        spin.setDecimals(1)
+        spin.setValue(default)
+        spin.setFixedWidth(90)
+        spin.setFixedHeight(32)
+
+        def _slider_to_spin(v):
+            spin.blockSignals(True)
+            spin.setValue(v / 10.0)
+            spin.blockSignals(False)
+
+        def _spin_to_slider(v):
+            slider.blockSignals(True)
+            slider.setValue(int(round(v * 10)))
+            slider.blockSignals(False)
+
+        slider.valueChanged.connect(_slider_to_spin)
+        spin.valueChanged.connect(_spin_to_slider)
+
+        row.addWidget(label)
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        return row, slider, spin
+
+    def _set_diff_defaults(self, values: dict):
+        """Set all four sliders/spinboxes to the given HP/CS/OD/AR values."""
+        pairs = (
+            ("hp", self.hp_slider, self.hp_spin),
+            ("cs", self.cs_slider, self.cs_spin),
+            ("od", self.od_slider, self.od_spin),
+            ("ar", self.ar_slider, self.ar_spin),
+        )
+        for key, slider, spin in pairs:
+            val = values.get(key, 5.0)
+            spin.blockSignals(True)
+            slider.blockSignals(True)
+            spin.setValue(val)
+            slider.setValue(int(round(val * 10)))
+            spin.blockSignals(False)
+            slider.blockSignals(False)
+
     def _build_actions(self) -> QWidget:
         wrap = QWidget()
         lay = QVBoxLayout(wrap)
@@ -932,6 +1162,23 @@ class App(QWidget):
         len_row.addWidget(QLabel("parts:"))
         len_row.addWidget(self.parts_spin, 0)
         lay.addLayout(len_row)
+
+        diff_heading = QLabel("Adjust Difficulty")
+        diff_heading.setObjectName("heading")
+        lay.addWidget(diff_heading)
+
+        hp_row, self.hp_slider, self.hp_spin = self._make_diff_row("HP:")
+        cs_row, self.cs_slider, self.cs_spin = self._make_diff_row("CS:")
+        od_row, self.od_slider, self.od_spin = self._make_diff_row("OD:")
+        ar_row, self.ar_slider, self.ar_spin = self._make_diff_row("AR:")
+        lay.addLayout(hp_row)
+        lay.addLayout(cs_row)
+        lay.addLayout(od_row)
+        lay.addLayout(ar_row)
+
+        self.adjust_btn = QPushButton("Generate Adjusted Map")
+        self.adjust_btn.clicked.connect(self._adjust_difficulty)
+        lay.addWidget(self.adjust_btn)
 
         out_row = QHBoxLayout()
         self.out_edit = QLineEdit(default_output_dir())
@@ -1014,6 +1261,7 @@ class App(QWidget):
                 self._source_name(source),
                 f"Mapper: {p.creator}  ·  source: {source.kind}",
                 self._source_bg(source))
+            self._set_diff_defaults(get_difficulty_values(p))
         self._autofill_stable_dir()
 
     def _fit(self, pm: QPixmap) -> QPixmap:
@@ -1172,6 +1420,64 @@ class App(QWidget):
 
         QMessageBox.information(self, "Done", "\n\n".join(messages))
 
+    def _finalize_adjusted(self, hp: float, cs: float, od: float, ar: float,
+                           label: str):
+        out_dir = self.out_edit.text() or default_output_dir()
+        source = self._source
+        do_lazer = self.lazer_check.isChecked()
+        do_stable = self.stable_check.isChecked()
+
+        messages: list[str] = [f"Adjusted to HP{hp} CS{cs} OD{od} AR{ar}."]
+
+        if not do_lazer and not do_stable:
+            try:
+                osz = package_adjusted_osz(source, hp, cs, od, ar, out_dir, label)
+            except Exception as e:
+                QMessageBox.critical(self, "Packaging failed", str(e))
+                return
+            self._set_status(f"Saved {osz}")
+            QMessageBox.information(self, "Done", "\n".join(messages) +
+                                    f"\nSaved to:\n{osz}")
+            return
+
+        if do_lazer:
+            try:
+                osz = package_adjusted_osz(source, hp, cs, od, ar, out_dir, label)
+                ok = import_osz(osz)
+            except Exception as e:
+                QMessageBox.critical(self, "Lazer import failed", str(e))
+                return
+            if ok:
+                messages.append(f"Lazer: imported {osz}")
+                self._set_status(f"Lazer import: {osz}")
+            else:
+                messages.append(f"Lazer: saved {osz} (no binary found)")
+                self._set_status(f"Lazer: saved {osz} (no binary found)")
+
+        if do_stable:
+            songs_root = self.stable_dir_edit.text().strip()
+            if not songs_root or not os.path.isdir(songs_root):
+                QMessageBox.critical(
+                    self, "Stable import needs a Songs folder",
+                    "Pick a valid stable Songs folder first (the "
+                    "'Songs folder' field — the Songs root, not a single "
+                    "beatmap folder).")
+                return
+            try:
+                result = write_adjusted_as_new_set(
+                    source, hp, cs, od, ar, songs_root, label)
+            except Exception as e:
+                QMessageBox.critical(self, "Stable import failed", str(e))
+                return
+            folder = result["folder"]
+            messages.append(
+                f"Stable: duplicated as a new set in\n{folder}\n"
+                f"Refresh song select (F5) to see it.")
+            self._set_status(
+                f"Stable import: new set '{os.path.basename(folder)}'")
+
+        QMessageBox.information(self, "Done", "\n\n".join(messages))
+
     def _split_difficulty(self):
         src = self._require_source()
         if src is None:
@@ -1193,6 +1499,16 @@ class App(QWidget):
         parts = self.parts_spin.value()
         res = split_by_length(src, parts)
         self._finalize(res.sections, f"{parts}-Part Split")
+
+    def _adjust_difficulty(self):
+        src = self._require_source()
+        if src is None:
+            return
+        hp = self.hp_spin.value()
+        cs = self.cs_spin.value()
+        od = self.od_spin.value()
+        ar = self.ar_spin.value()
+        self._finalize_adjusted(hp, cs, od, ar, "Difficulty Adjust")
 
 
 def main():
